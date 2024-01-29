@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	. "github.com/hirochachacha/go-smb2/internal/erref"
-	. "github.com/hirochachacha/go-smb2/internal/smb2"
+	. "github.com/projectdiscovery/go-smb2/internal/erref"
+	. "github.com/projectdiscovery/go-smb2/internal/smb2"
 )
 
 // Negotiator contains options for func (*Dialer) Dial.
@@ -500,13 +500,34 @@ func (conn *conn) runSender() {
 
 func (conn *conn) runReciever() {
 	var err error
+	defer func() {
+		select {
+		case <-conn.rdone:
+			err = nil
+		default:
+			logger.Println("error:", err)
+		}
+
+		conn.m.Lock()
+		defer conn.m.Unlock()
+
+		conn.outstandingRequests.shutdown(err)
+
+		conn.err = err
+
+		close(conn.wdone)
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			err = &InternalError{fmt.Sprintf("panic: %v", r)}
+		}
+	}()
 
 	for {
 		n, e := conn.t.ReadSize()
 		if e != nil {
 			err = &TransportError{e}
-
-			goto exit
+			return
 		}
 
 		pkt := make([]byte, n)
@@ -514,8 +535,7 @@ func (conn *conn) runReciever() {
 		_, e = conn.t.Read(pkt)
 		if e != nil {
 			err = &TransportError{e}
-
-			goto exit
+			return
 		}
 
 		hasSession := conn.useSession()
@@ -526,7 +546,6 @@ func (conn *conn) runReciever() {
 			pkt, e, isEncrypted = conn.tryDecrypt(pkt)
 			if e != nil {
 				logger.Println("skip:", e)
-
 				continue
 			}
 
@@ -534,14 +553,12 @@ func (conn *conn) runReciever() {
 			if s := conn.session; s != nil {
 				if s.sessionId != p.SessionId() {
 					logger.Println("skip:", &InvalidResponseError{"unknown session id"})
-
 					continue
 				}
 
 				if tc, ok := s.treeConnTables[p.TreeId()]; ok {
 					if tc.treeId != p.TreeId() {
 						logger.Println("skip:", &InvalidResponseError{"unknown tree id"})
-
 						continue
 					}
 				}
@@ -553,7 +570,8 @@ func (conn *conn) runReciever() {
 		for {
 			p := PacketCodec(pkt)
 
-			if off := p.NextCommand(); off != 0 {
+			if off := p.NextCommand(); off != 0 && int(off) < len(pkt) {
+				//should we exit in case of malformed packet like this?
 				pkt, next = pkt[:off], pkt[off:]
 			} else {
 				next = nil
@@ -575,23 +593,6 @@ func (conn *conn) runReciever() {
 			pkt = next
 		}
 	}
-
-exit:
-	select {
-	case <-conn.rdone:
-		err = nil
-	default:
-		logger.Println("error:", err)
-	}
-
-	conn.m.Lock()
-	defer conn.m.Unlock()
-
-	conn.outstandingRequests.shutdown(err)
-
-	conn.err = err
-
-	close(conn.wdone)
 }
 
 func accept(cmd uint16, pkt []byte) (res []byte, err error) {
