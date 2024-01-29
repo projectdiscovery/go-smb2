@@ -205,6 +205,9 @@ func (p PacketCodec) SetSignature(bs []byte) {
 }
 
 func (p PacketCodec) Data() []byte {
+	if len(p) < 64 {
+		return nil
+	}
 	return p[64:]
 }
 
